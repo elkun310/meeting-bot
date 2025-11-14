@@ -1,12 +1,10 @@
 from fastapi import FastAPI, Request
-import subprocess
 import requests
 import os
 import json
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
 import time
-import locale
 from langdetect import detect, DetectorFactory
 from datetime import datetime
 
@@ -17,42 +15,41 @@ app = FastAPI()
 load_dotenv()
 NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
-OLLAMA_MODEL = "llama3"
-LARK_APP_ID = os.getenv("LARK_APP_ID")
-LARK_APP_SECRET = os.getenv("LARK_APP_SECRET")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Cache cho tenant access token
-tenant_token_cache = {"token": None, "expire_time": 0}
+# Lark credentials
+LARK_APP_ID = os.getenv("LARK_APP_ID")
+LARK_APP_SECRET = os.getenv("LARK_APP_SECRET")
 
+# Slack credentials
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+
+# Cache & dedup
+tenant_token_cache = {"token": None, "expire_time": 0}
+processed_messages = set()
+
+# ==================== LARK TOKEN ====================
 def get_tenant_access_token():
-    """Lấy tenant access token từ Lark"""
     if tenant_token_cache["token"] and time.time() < tenant_token_cache["expire_time"]:
         return tenant_token_cache["token"]
-    
+
     url = "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal"
     headers = {"Content-Type": "application/json"}
     data = {"app_id": LARK_APP_ID, "app_secret": LARK_APP_SECRET}
-    
-    response = requests.post(url, headers=headers, json=data)
-    result = response.json()
-    
-    if result.get("code") == 0:
-        token = result["tenant_access_token"]
+    res = requests.post(url, headers=headers, json=data).json()
+
+    if res.get("code") == 0:
+        token = res["tenant_access_token"]
         tenant_token_cache["token"] = token
-        tenant_token_cache["expire_time"] = time.time() + result.get("expire", 7200) - 300
+        tenant_token_cache["expire_time"] = time.time() + res.get("expire", 7200) - 300
         return token
-    else:
-        raise Exception(f"Failed to get tenant token: {result}")
+    raise Exception("Failed to get Lark tenant token")
 
-# Deduplicate cache theo message_id
-processed_messages = set()  # lưu tuple (message_id, chat_id)
-
+# ==================== LARK WEBHOOK ====================
 @app.post("/webhook")
-async def receive_meeting(request: Request):
+async def lark_webhook(request: Request):
     body = await request.json()
 
-    # ✅ Xử lý challenge từ Lark
     if "challenge" in body:
         return JSONResponse(content={"challenge": body["challenge"]})
 
@@ -62,102 +59,124 @@ async def receive_meeting(request: Request):
     message_id = message.get("message_id")
     message_type = message.get("message_type")
 
-    # Deduplicate theo message_id + chat_id
-    key = (message_id, chat_id)
-    if key in processed_messages:
-        print(f"⚠️ Duplicate message {key}, ignoring...")
+    if (message_id, chat_id, "lark") in processed_messages:
         return {"status": "duplicate"}
-    processed_messages.add(key)
+    processed_messages.add((message_id, chat_id, "lark"))
 
-    # Chỉ xử lý text message
     if message_type != "text":
-        return {"status": "ignored", "reason": "not a text message"}
+        return {"status": "ignored"}
 
-    content = message.get("content", "{}")
     try:
-        text = json.loads(content).get("text", "")
+        text = json.loads(message.get("content", "{}")).get("text", "")
     except json.JSONDecodeError:
-        text = content
+        text = message.get("content", "")
 
-    if not text or not text.strip():
-        return {"status": "ignored", "reason": "empty text"}
+    if not text.strip():
+        return {"status": "ignored"}
 
-    # Tránh loop từ bot
-    sender = event.get("sender", {})
-    if sender.get("sender_type") == "app":
-        return {"status": "ignored", "reason": "message from bot"}
+    if event.get("sender", {}).get("sender_type") == "app":
+        return {"status": "ignored"}
 
-    print(f"✅ Processing message: {text[:100]}...")
+    # Trigger keywords
+    trigger_keywords = ["/summary", "/tóm tắt", "/tomtat", "!summary", "!tóm tắt"]
+    triggered = any(text.lower().strip().startswith(k) for k in trigger_keywords)
+    if not triggered:
+        return {"status": "ignored"}
+
+    text = text.split(maxsplit=1)[-1] if " " in text else ""
 
     try:
-        # Tóm tắt
-        print("🤖 Summarizing with Ollama...")
         summary = summarize_with_groq(text)
-        print(f"✅ Summary generated: {summary[:100]}...")
-
-        # Lưu vào Notion
-        print("💾 Saving to Notion...")
-        notion_response = save_to_notion(text, summary)
-        print(f"✅ Notion response: {notion_response.status_code}")
-
-        # Gửi kết quả về Lark
-        print("📤 Sending message to Lark...")
+        save_to_notion(text, summary, platform="Lark")
         send_message_to_lark(summary, chat_id)
-        print("✅ Message sent!")
-
-        return {"status": "success", "summary": summary, "notion_status": notion_response.status_code}
-
+        return {"status": "success"}
     except Exception as e:
-        import traceback
-        traceback.print_exc()
         return {"status": "error", "error": str(e)}
 
-def summarize_with_groq(text):
-    """Tóm tắt văn bản bằng Groq API, tự động theo ngôn ngữ văn bản"""
-    
-    # Detect ngôn ngữ
-    # try:
-    #     lang = detect(text)
-    # except:
-    #     lang = "en"
-    
-    # Tùy theo ngôn ngữ, tạo prompt
-    # if lang == "vi":
-    prompt = f"Tóm tắt ngắn gọn nội dung cuộc họp sau bằng tiếng Việt, nêu các điểm chính:\n\n{text}"
-    # elif lang == "ja":
-    #     prompt = f"以下の会議内容を簡潔に日本語でまとめ、重要なポイントを箇条書きしてください：\n\n{text}"
-    # else:
-    #     prompt = f"Summarize the following meeting notes in English, highlighting the key points:\n\n{text}"
-    
-    if not GROQ_API_KEY:
-        return "❌ Thiếu GROQ_API_KEY trong file .env. Đăng ký tại https://console.groq.com/"
+# ==================== SLACK WEBHOOK ====================
+@app.post("/slack/events")
+async def slack_webhook(request: Request):
+    body = await request.json()
+
+    if body.get("type") == "url_verification":
+        return JSONResponse(content={"challenge": body["challenge"]})
+
+    if body.get("type") != "event_callback":
+        return {"status": "ignored"}
+
+    event = body.get("event", {})
+    if event.get("bot_id") or event.get("subtype") == "bot_message":
+        return {"status": "ignored"}
+
+    if event.get("type") != "message":
+        return {"status": "ignored"}
+
+    text = event.get("text", "")
+    channel = event.get("channel")
+    ts = event.get("ts")
+
+    if (ts, channel, "slack") in processed_messages:
+        return {"status": "duplicate"}
+    processed_messages.add((ts, channel, "slack"))
+
+    if not text.strip():
+        return {"status": "ignored"}
+
+    # Trigger check
+    import re
+    text = re.sub(r"<@U[A-Z0-9]+>", "", text).strip()
+    trigger_keywords = ["!summary", "!tóm tắt", "!tomtat", "summary:", "tóm tắt:"]
+    triggered = any(text.lower().startswith(k) for k in trigger_keywords)
+    if not triggered:
+        return {"status": "ignored"}
+
+    text = text.split(maxsplit=1)[-1] if " " in text else ""
 
     try:
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.1-8b-instant",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 500,
-                "temperature": 0.7
-            },
-            timeout=30
-        )
-
-        if response.status_code == 200:
-            return response.json()["choices"][0]["message"]["content"].strip()
-        else:
-            return f"❌ Lỗi Groq API ({response.status_code}): {response.text}"
-    except requests.exceptions.Timeout:
-        return "⏱️ Groq API timeout"
+        summary = summarize_with_groq(text)
+        save_to_notion(text, summary, platform="Slack")
+        send_message_to_slack(summary, channel)
+        return {"status": "success"}
     except Exception as e:
-        return f"❌ Lỗi Groq: {str(e)}"
-    
-def save_to_notion(original_text, summary):
+        return {"status": "error", "error": str(e)}
+
+# ==================== SHARED FUNCTIONS ====================
+def summarize_with_groq(text):
+    if not GROQ_API_KEY:
+        return "❌ Missing GROQ_API_KEY"
+
+    try:
+        lang = detect(text)
+    except:
+        lang = "vi"
+
+    if lang == "vi":
+        prompt = f"Tóm tắt ngắn gọn nội dung cuộc họp sau bằng tiếng Việt:\n\n{text}"
+    elif lang == "ja":
+        prompt = f"以下の会議内容を日本語で簡潔にまとめてください:\n\n{text}"
+    else:
+        prompt = f"Summarize the following meeting notes in English:\n\n{text}"
+
+    res = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 500,
+            "temperature": 0.7
+        },
+        timeout=30
+    )
+
+    if res.status_code == 200:
+        return res.json()["choices"][0]["message"]["content"].strip()
+    return f"Groq API error: {res.status_code}"
+
+def save_to_notion(original_text, summary, platform="Unknown"):
     url = "https://api.notion.com/v1/pages"
     headers = {
         "Authorization": f"Bearer {NOTION_API_KEY}",
@@ -165,71 +184,63 @@ def save_to_notion(original_text, summary):
         "Notion-Version": "2022-06-28"
     }
 
-    def truncate_text(text, max_length=1900):
-        return text[:max_length] + "..." if len(text) > max_length else text
+    def truncate(text, max_len=1900):
+        return text[:max_len] + "..." if len(text) > max_len else text
 
-    # Detect ngôn ngữ
     try:
         lang = detect(original_text)
     except:
-        lang = "en"  # fallback nếu detect fail
+        lang = "vi"
 
-    # Set locale, format ngày và tiêu đề theo ngôn ngữ
+    now = datetime.now()
     if lang == "vi":
-        try:
-            locale.setlocale(locale.LC_TIME, "vi_VN.UTF-8")
-        except locale.Error:
-            locale.setlocale(locale.LC_TIME, "")
-        date_str = datetime.now().strftime("%d/%m/%Y")
-        title = f"Tóm tắt cuộc họp - {date_str}"
-        
+        title = f"[{platform}] Tóm tắt cuộc họp - {now:%d/%m/%Y}"
     elif lang == "ja":
-        now = datetime.now()
-        date_str = f"{now.year}年{now.month}月{now.day}日"
-        title = f"会議の要約 - {date_str}"
-        
-    elif lang == "ko":
-        now = datetime.now()
-        date_str = f"{now.year}년 {now.month}월 {now.day}일"
-        title = f"회의 요약 - {date_str}"
-        
-    elif lang == "zh-cn" or lang == "zh-tw":
-        now = datetime.now()
-        date_str = f"{now.year}年{now.month}月{now.day}日"
-        title = f"会议总结 - {date_str}"
-        
-    else:  # English và các ngôn ngữ khác
-        try:
-            locale.setlocale(locale.LC_TIME, "en_US.UTF-8")
-        except locale.Error:
-            locale.setlocale(locale.LC_TIME, "")
-        date_str = datetime.now().strftime("%b %d, %Y")
-        title = f"Meeting Summary - {date_str}"
+        title = f"[{platform}] 会議の要約 - {now:%Y年%m月%d日}"
+    else:
+        title = f"[{platform}] Meeting Summary - {now:%b %d, %Y}"
 
     data = {
         "parent": {"database_id": NOTION_DATABASE_ID},
         "properties": {
             "Meeting Title": {"title": [{"text": {"content": title}}]},
-            "Full Transcript": {"rich_text": [{"text": {"content": truncate_text(original_text)}}]},
-            "Summary": {"rich_text": [{"text": {"content": truncate_text(summary)}}]}
+            "Full Transcript": {"rich_text": [{"text": {"content": truncate(original_text)}}]},
+            "Summary": {"rich_text": [{"text": {"content": truncate(summary)}}]}
         }
     }
-
-    response = requests.post(url, headers=headers, json=data)
-    return response
+    return requests.post(url, headers=headers, json=data)
 
 def send_message_to_lark(summary, chat_id):
     token = get_tenant_access_token()
     url = "https://open.larksuite.com/open-apis/im/v1/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     params = {"receive_id_type": "chat_id"}
-    data = {"receive_id": chat_id, "msg_type": "text", "content": json.dumps({"text": f"📝 Tóm tắt cuộc họp:\n\n{summary}"})}
-    response = requests.post(url, headers=headers, params=params, json=data)
-    return response
+    data = {
+        "receive_id": chat_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": f"📝 Tóm tắt cuộc họp:\n\n{summary}"})
+    }
+    return requests.post(url, headers=headers, params=params, json=data)
 
+def send_message_to_slack(summary, channel):
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {"channel": channel, "text": f"📝 *Meeting Summary:*\n\n{summary}"}
+    requests.post(url, headers=headers, json=data)
+
+# ==================== HEALTH CHECK ====================
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "platforms": {
+            "lark": bool(LARK_APP_ID and LARK_APP_SECRET),
+            "slack": bool(SLACK_BOT_TOKEN)
+        }
+    }
 
 if __name__ == "__main__":
     import uvicorn
